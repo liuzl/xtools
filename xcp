@@ -1,0 +1,285 @@
+#!/usr/bin/env python
+'''
+1. list all hosts available
+    xcp -l
+2. copy srcfle of LOCALHOST to host1 as /tmp/dstfile
+    xcp srcfile host1:/tmp/dstfile
+
+3. copy srcfle of LOCALHOST to host1 as $HOME/srcfile
+    xcp srcfile host1
+
+4. receive srcfile from host1:/tmp/dstfile as ./dstfile
+    xcp host1:/tmp/dstfile
+
+5. receive srcfile from host1:/tmp/dstfile as ~/myfile
+    xcp host1:/tmp/dstfile ~/myfile
+
+6. you can use regex pattern as hostname
+    xcp host[1-2]:/tmp/srcfile dstfile
+
+7. input username and password in command line
+    xcp 192.168.0.100:/tmp/srcfile
+'''
+
+import re
+import os
+import sys
+import optparse
+import traceback
+import getpass
+import cStringIO
+from pexpect import *
+from parse_ini import *
+
+
+def search_host(pat, xtools_hosts):
+    ''' search host from pat or user\'s selection '''
+    select_hosts = {}
+    for name, host in xtools_hosts.items():
+        if re.search(pat, name):
+            select_hosts[name] = host
+
+    nr = len(select_hosts)
+    if nr == 0 and re.match(r'\d+\.\d+\.\d+\.\d+', pat):
+        cli_username = raw_input('username for %s: ' % pat)
+        cli_password = getpass.getpass('%s\'s password: ' % cli_username)
+        return [{'host':pat, 'username':cli_username, 'password':cli_password}]
+    if RECV_MODE:
+        if nr > 1:
+            show_available_hosts(select_hosts)
+            name = raw_input('which name? ')
+            if name in select_hosts:
+                return [select_hosts[name]]
+            else:
+                return []
+        else:
+            return select_hosts.values()
+    else:
+        unique_hosts = {}
+        for host in select_hosts.values():
+            unique_hosts[host['host']] = host
+        return unique_hosts.values()    
+
+
+def remote_exec(host, exec_cmd):
+    ''' execute a command on remote host and return its output '''
+    if host.get('port'):
+        cmd = 'ssh -q -p %s %s@%s "%s"' % (host.get('port'), host['username'], host['host'], exec_cmd)
+    else:
+        cmd = 'ssh -q %s@%s "%s"' % (host['username'], host['host'], exec_cmd)
+
+    handle = spawn(cmd)
+    events = ["(?i)are you sure you want to continue connecting", 
+              "(?i)(?:password)|(?:passphrase for key)", 
+              "(?i)permission denied", 
+              "(?i)connection closed by remote host", 
+              EOF, 
+              TIMEOUT]
+    i = handle.expect(events, timeout=2)
+
+    # First phase
+    if i==0: 
+        # New certificate -- always accept it.
+        # This is what you get if SSH does not have the remote host's
+        # public key stored in the 'known_hosts' cache.
+        handle.sendline("yes")
+        i = handle.expect(events)
+    if i==1: # password or passphrase
+        handle.sendline(host['password'])
+        i = handle.expect(events)
+        
+    # Second phase
+    if i==1: # password prompt again
+        # For incorrect passwords, some ssh servers will
+        # ask for the password again, others return 'denied' right away.
+        # If we get the password prompt again then this means
+        # we didn't get the password right the first time. 
+        handle.close()
+        raise ExceptionPexpect ('password refused')
+    elif i==2: # permission denied -- password was bad.
+        handle.close()
+        raise ExceptionPexpect ('permission denied')
+    elif i==3: # Connection closed by remote host
+        handle.close()
+        raise ExceptionPexpect ('connection closed')
+    elif i==4: # received EOF
+        output = handle.before.split()[-1]
+        handle.close()
+        return output
+    elif i==5: # Timeout
+        #This is tricky... I presume that we are at the command-line prompt.
+        #It may be that the shell prompt was so weird that we couldn't match
+        #it. Or it may be that we couldn't log in for some other reason. I
+        #can't be sure, but it's safe to guess that we did login because if
+        #I presume wrong and we are not logged in then this should be caught
+        #later when I try to set the shell prompt.
+        pass
+    else: # Unexpected 
+        handle.close()
+        raise ExceptionPexpect ('unexpected login response')
+   
+
+def local_exists(filename):
+    import subprocess
+    cmd = "test -e %s && (test -d %s && echo 'DIR' || echo 'FILE') || echo 'NONE'" % (filename, filename)
+    return subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE).communicate()[0].strip()
+
+
+def remote_exists(remote_hosts, filename):
+    ret = 'NONE'
+    for host in remote_hosts:
+        cmd = "test -e %s && (test -d %s && echo 'DIR' || echo 'FILE') || echo 'NONE'" % (filename, filename)
+        ret = remote_exec(host, cmd).strip()
+        if ret != 'NONE':
+            return ret
+    return ret
+
+
+def main():
+    remote_hosts = search_host(HOST_PATTERN, XTOOLS_HOSTS)
+    if len(remote_hosts) == 0:
+        return
+   
+    if not RECV_MODE:
+        file_status = local_exists(SRC_FILE)    
+        if file_status == 'NONE':
+            print SRC_FILE, 'does not exists'
+            return
+        elif file_status == 'DIR':
+            confirm = raw_input('sync %s ? ' % SRC_FILE)
+            if re.match(r'(?i)(y|yes)$', confirm) is None:
+               return 
+
+        print '%s --> %s' % (SRC_FILE, DST_FILE)
+        print '\n'.join([host['host'] for host in remote_hosts])
+        confirm = raw_input('sync files on those hosts ? ')
+        if re.match(r'(?i)(y|yes)$', confirm) is None:
+           return 
+
+    else:
+        file_status = remote_exists(remote_hosts, SRC_FILE)    
+        if file_status == 'NONE':
+            print SRC_FILE, 'does not exists'
+            return
+        elif file_status == 'DIR':
+            confirm = raw_input('sync %s ? ' % SRC_FILE)
+            if re.match(r'(?i)(y|yes)$', confirm) is None:
+               return 
+
+    for host in remote_hosts:
+        if host.get('port'):
+            ssh_option = '-e "ssh -p %s"' % host.get('port')
+        else:
+            ssh_option = ''
+        if RECV_MODE:
+            remote_info = '%s@%s:%s' % (host['username'], host['host'], SRC_FILE)
+            local_info = os.path.expanduser(DST_FILE)
+            cmd = "rsync -azr %s %s %s" % (ssh_option, remote_info, local_info)    
+        else:
+            local_info = os.path.expanduser(SRC_FILE)
+            remote_info = '%s@%s:%s' % (host['username'], host['host'], DST_FILE)
+            cmd = 'rsync -azr %s %s %s' % (ssh_option, local_info, remote_info)    
+                
+                
+        # This does not distinguish between a remote server 'password' prompt
+        # and a local ssh 'passphrase' prompt (for unlocking a private key).
+        handle = spawn(cmd)
+        events = ["(?i)are you sure you want to continue connecting", "(?i)(?:password)|(?:passphrase for key)", "(?i)permission denied", "(?i)connection closed by remote host", EOF, TIMEOUT]
+        i = handle.expect(events, timeout=2)
+    
+        # First phase
+        if i==0: 
+            # New certificate -- always accept it.
+            # This is what you get if SSH does not have the remote host's
+            # public key stored in the 'known_hosts' cache.
+            handle.sendline("yes")
+            i = handle.expect(events)
+        if i==1: # password or passphrase
+            handle.sendline(host['password'])
+            i = handle.expect(events)
+            
+        # Second phase
+        if i==1: # password prompt again
+            # For incorrect passwords, some ssh servers will
+            # ask for the password again, others return 'denied' right away.
+            # If we get the password prompt again then this means
+            # we didn't get the password right the first time. 
+            handle.close()
+            raise ExceptionPexpect ('password refused')
+        elif i==2: # permission denied -- password was bad.
+            handle.close()
+            raise ExceptionPexpect ('permission denied')
+        elif i==3: # Connection closed by remote host
+            handle.close()
+            raise ExceptionPexpect ('connection closed')
+        elif i==4: # received EOF
+            sout = cStringIO.StringIO(handle.before)
+            failed = False
+            for line in sout:
+                if line.find('No such file or directory') != -1:
+                    print line,
+                    failed = True
+            print host['host'], (failed and 'FAIL' or 'DONE')
+        elif i==5: # Timeout
+            #This is tricky... I presume that we are at the command-line prompt.
+            #It may be that the shell prompt was so weird that we couldn't match
+            #it. Or it may be that we couldn't log in for some other reason. I
+            #can't be sure, but it's safe to guess that we did login because if
+            #I presume wrong and we are not logged in then this should be caught
+            #later when I try to set the shell prompt.
+            pass
+        else: # Unexpected 
+            handle.close()
+            raise ExceptionPexpect ('unexpected login response')
+        
+        handle.close()
+        
+        
+if __name__ == '__main__':
+    try:
+        PARSER = optparse.OptionParser(formatter=optparse.TitledHelpFormatter(), 
+                usage=globals()['__doc__'], 
+                version='1.0 2009-07-13 colinli',
+                conflict_handler="resolve")
+        PARSER.add_option ('-v', '--verbose', action='store_true', default=False, help='verbose output')        
+        PARSER.add_option ('-l', '--list', action='store_true', default=False, help='list all hosts in config file')
+        (OPTIONS, CLI_ARGS) = PARSER.parse_args()
+
+        XTOOLS_HOSTS = parse_config_file()
+        if OPTIONS.list:
+            show_available_hosts(XTOOLS_HOSTS)
+            sys.exit(0)
+        if len(CLI_ARGS) == 0:
+            PARSER.error('missing argument')
+            
+        if CLI_ARGS[0].find(':') != -1:
+            RECV_MODE = True
+            HOST_PATTERN, SRC_FILE = CLI_ARGS[0].split(':', 1)
+            if len(CLI_ARGS) == 2:
+                DST_FILE = CLI_ARGS[1]
+            else:
+                DST_FILE = '.'
+        else:
+            RECV_MODE = False
+            SRC_FILE = CLI_ARGS[0]
+            if len(CLI_ARGS) != 2:
+                PARSER.error('missing argument')
+            if CLI_ARGS[1].find(':') != -1:
+                HOST_PATTERN, DST_FILE = CLI_ARGS[1].split(':', 1)
+            else:
+                HOST_PATTERN, DST_FILE = CLI_ARGS[1], ''         
+
+        main()
+
+        sys.exit(0)
+    except KeyboardInterrupt, e: # Ctrl-C
+        sys.exit(0)
+    except SystemExit, e: # sys.exit()
+        raise e
+    except Exception, e:
+        print 'ERROR, UNEXPECTED EXCEPTION'
+        print str(e)
+        traceback.print_exc()
+        os._exit(1)
+
+# vi:ts=4:sw=4:expandtab:ft=python:

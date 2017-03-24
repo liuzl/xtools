@@ -1,0 +1,232 @@
+#!/usr/bin/env python
+'''
+the username & password is loaded from xtools.ini
+1. show all avilable hosts
+    go -l
+
+2. specify the remote host name
+    go host1
+
+3. specify the host name pattern, select from many host
+    go host[1-2]
+
+4. input username and password in command line, it will try default config firstlly
+    go 192.168.0.100#22
+'''
+
+import re
+import os
+import sys
+import optparse
+import traceback
+import getpass
+
+from pexpect import *
+from parse_ini import *
+
+def getTerminalSize():
+    def ioctl_GWINSZ(fd):
+        try:
+            import fcntl, termios, struct, os
+            cr = struct.unpack('hh', fcntl.ioctl(fd, termios.TIOCGWINSZ,
+        '1234'))
+        except:
+            return None
+        return cr
+    cr = ioctl_GWINSZ(0) or ioctl_GWINSZ(1) or ioctl_GWINSZ(2)
+    if not cr:
+        try:
+            fd = os.open(os.ctermid(), os.O_RDONLY)
+            cr = ioctl_GWINSZ(fd)
+            os.close(fd)
+        except:
+            pass
+    if not cr:
+        try:
+            cr = (env['LINES'], env['COLUMNS'])
+        except:
+            cr = (25, 80)
+    return int(cr[1]), int(cr[0])
+
+
+def search_host(pat, xtools_hosts):
+    ''' search host from pat or user\'s selection '''
+    def mask_password(password):
+        ''' protect the password '''
+        length = len(password)
+        if length < 8:
+            return '*' * length
+        else:
+            return password[:3] + '*' * (length-6) + password[-3:]
+
+    if pat.find('#') != -1:
+        host_pat, port = pat.split('#', 1)
+    else:
+        host_pat, port = pat, None
+
+    select_hosts = {}
+    for name, host in xtools_hosts.items():
+        if re.search(host_pat, name):
+            select_hosts[name] = host
+
+    nr = len(select_hosts)
+    if nr == 0:
+        common_config = xtools_hosts.get(COMMON_SECTION_NAME, {})
+        username = common_config.get('username')
+        password = common_config.get('password')
+        if port is None:
+            port = common_config.get('port')
+        print 'connect to %s@%s#%s using password:%s' % (username, host_pat, port, mask_password(password))
+        return {'host':host_pat, 'username':username, 'password':password, 'port':port}    
+    elif nr == 1:
+        return select_hosts.values()[0]
+    else:
+        show_available_hosts(select_hosts)
+        name = raw_input('which name? ')
+        return select_hosts.get(name)
+    
+    
+def try_login(remote_host, try_nr = 1):
+    if try_nr > 3:
+        print 'You have tried 3 times, now exit'
+        return
+    else:    
+        try_nr += 1
+    
+    # build ssh command
+    ssh_options = '-q'
+    port = remote_host.get('port')
+    if port:
+        ssh_options += ' -p ' + str(port)    
+    cmd = 'ssh %s -l %s %s' % (ssh_options, remote_host['username'], remote_host['host'])
+    
+    # This does not distinguish between a remote server 'password' prompt
+    # and a local ssh 'passphrase' prompt (for unlocking a private key).
+    handle = spawn(cmd)
+    events = ["(?i)are you sure you want to continue connecting", 
+              "(?i)(?:password)|(?:passphrase for key)", 
+              "(?i)permission denied", 
+              "(?i)terminal type", 
+              "(?i)connection closed by remote host",
+              r'[#>\]$]', 
+              EOF,
+              TIMEOUT]
+    i = handle.expect(events, timeout=2)
+
+    # First phase
+    if i==0: 
+        # New certificate -- always accept it.
+        # This is what you get if SSH does not have the remote host's
+        # public key stored in the 'known_hosts' cache.
+        handle.sendline("yes")
+        i = handle.expect(events, timeout=2)
+    if i==1: # password or passphrase
+        handle.sendline(remote_host['password'])
+        i = handle.expect(events)
+
+    # Second phase
+    if i==0:
+        # This is weird. This should not happen twice in a row.
+        handle.close()
+        raise ExceptionPexpect ('Weird error. Got "are you sure" prompt twice.')
+    elif i==1: # password prompt again
+        # For incorrect passwords, some ssh servers will
+        # ask for the password again, others return 'denied' right away.
+        # If we get the password prompt again then this means
+        # we didn't get the password right the first time.
+        print '%s login failed, password refused' % remote_host['username']
+        remote_host['username'] = raw_input('username for %s: ' % HOST_PATTERN)
+        remote_host['password'] = getpass.getpass('%s\'s password: ' % remote_host['username'])        
+        handle.close()
+        handle = try_login(remote_host, try_nr)        
+        if handle:
+            record_password(remote_host, XTOOLS_HOSTS)
+    elif i==2: # permission denied -- password was bad.
+        handle.close()
+        print 'permission denied for %s@%s' % (remote_host['username'], remote_host['password'])
+        return
+    elif i==3: # terminal type again? WTF?
+        handle.close()
+        raise ExceptionPexpect ('Weird error. Got "terminal type" prompt twice.')
+    elif i==4: # Connection closed by remote host
+        handle.close()
+        raise ExceptionPexpect ('connection closed')
+    elif i==5: # can occur if you have a public key pair set to authenticate. 
+        ### TODO: May NOT be OK if expect() got tricked and matched a false prompt.
+        pass
+    elif i==6:
+        handle.close()
+        print '%s@%s#%s login failed' % (remote_host['username'], remote_host['host'], remote_host['port'])
+        return
+    elif i==7: # Timeout
+        #This is tricky... I presume that we are at the command-line prompt.
+        #It may be that the shell prompt was so weird that we couldn't match
+        #it. Or it may be that we couldn't log in for some other reason. I
+        #can't be sure, but it's safe to guess that we did login because if
+        #I presume wrong and we are not logged in then this should be caught
+        #later when I try to set the shell prompt.
+        handle.close()
+        print 'timeout when connecting ', remote_host['host']
+        return
+    else: # Unexpected 
+        handle.close()
+        raise ExceptionPexpect ('unexpected login response')
+    
+    return handle    
+    
+def main():
+    remote_host = search_host(HOST_PATTERN, XTOOLS_HOSTS)
+    if not remote_host:
+        print 'no host was chosen'
+        return
+    
+    handle = try_login(remote_host)
+    if not handle:
+        return
+        
+    handle.sendline()
+    (a, b) = getTerminalSize()
+    handle.setwinsize(b, a)
+
+    try:    
+        handle.interact()    
+        sys.exit(0)
+    except:    
+        sys.exit(1)    
+        
+        
+if __name__ == '__main__':
+    try:
+        PARSER = optparse.OptionParser(formatter=optparse.TitledHelpFormatter(), 
+                usage=globals()['__doc__'], 
+                version='1.0 2009-07-13 colinli',
+                conflict_handler="resolve")
+        PARSER.add_option ('-v', '--verbose', action='store_true', default=False, help='verbose output')
+        PARSER.add_option ('-l', '--list', action='store_true', default=False, help='verbose output')
+        (OPTIONS, CLI_ARGS) = PARSER.parse_args()
+
+        XTOOLS_HOSTS = parse_config_file()
+
+        if OPTIONS.list:
+            show_available_hosts(XTOOLS_HOSTS)
+            sys.exit(0)
+
+        if len(CLI_ARGS) < 1:
+            PARSER.error ('missing argument')
+        else:
+            HOST_PATTERN = CLI_ARGS[0]
+
+        main()
+
+        sys.exit(0)
+    except KeyboardInterrupt, e: # Ctrl-C
+        sys.exit(1)
+    except SystemExit, e: # sys.exit()
+        raise e
+    except Exception, e:
+        print 'ERROR, UNEXPECTED EXCEPTION'
+        print str(e)
+        traceback.print_exc()
+        os._exit(1)
+
+# vi:ts=4:sw=4:expandtab:ft=python:
