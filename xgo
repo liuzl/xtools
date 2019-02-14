@@ -1,17 +1,17 @@
 #!/usr/bin/env python
 '''
-the username & password is loaded from xtools.ini
+the username & password are loaded from xtools.ini
 1. show all avilable hosts
-    go -l
+    xgo -l
 
 2. specify the remote host name
-    go host1
+    xgo host1
 
 3. specify the host name pattern, select from many host
-    go host[1-2]
+    xgo host[1-2]
 
 4. input username and password in command line, it will try default config firstlly
-    go 192.168.0.100#22
+    xgo 192.168.0.100#22
 '''
 
 import re
